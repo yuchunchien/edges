@@ -7,6 +7,10 @@
 #include "math.h"
 #include <algorithm>
 #include <vector>
+#include <iostream>
+#include <string>
+#include <fstream>
+#include <sstream>
 using namespace std;
 #define PI 3.14159265f
 int clamp( int v, int a, int b ) { return v<a?a:v>b?b:v; }
@@ -33,6 +37,7 @@ typedef Array<int> arrayi;
 typedef struct { int c, r, w, h; float s; } Box;
 typedef vector<Box> Boxes;
 bool boxesCompare( const Box &a, const Box &b ) { return a.s<b.s; }
+bool boxesAreaCompare( const Box &a, const Box &b ) { return (a.w*a.h)>(b.w*b.w); }
 float boxesOverlap( Box &a, Box &b );
 void boxesNms( Boxes &boxes, float thr, float eta, int maxBoxes );
 
@@ -44,6 +49,7 @@ public:
   float _alpha, _beta, _eta, _minScore; int _maxBoxes;
   float _edgeMinMag, _edgeMergeThr, _clusterMinMag;
   float _maxAspectRatio, _minBoxArea, _gamma, _kappa;
+  string _filename;
 
   // main external routine (set parameters first)
   void generate( Boxes &boxes, arrayf &E, arrayf &O, arrayf &V );
@@ -72,14 +78,17 @@ private:
   void scoreAllBoxes( Boxes &boxes );
   void scoreBox( Box &box );
   void refineBox( Box &box );
+  void refineBox( Box &box, int h, int w);
   void drawBox( Box &box, arrayf &E, arrayf &V );
+  void getGT( Boxes &boxes );
 };
 
 ////////////////////////////////////////////////////////////////////////////////
 
 void EdgeBoxGenerator::generate( Boxes &boxes, arrayf &E, arrayf &O, arrayf &V )
 {
-  clusterEdges(E,O,V); prepDataStructs(E); scoreAllBoxes(boxes);
+  clusterEdges(E,O,V); prepDataStructs(E); //scoreAllBoxes(boxes);
+  getGT(boxes);
 }
 
 void EdgeBoxGenerator::clusterEdges( arrayf &E, arrayf &O, arrayf &V )
@@ -312,6 +321,9 @@ void EdgeBoxGenerator::refineBox( Box &box )
   int rStep = int(box.h*_rcStepRatio);
   int cStep = int(box.w*_rcStepRatio);
   while( 1 ) {
+    //cout << "rStep: " << rStep << endl;
+    //cout << "cStep: " << cStep << endl;
+      
     // prepare for iteration
     rStep/=2; cStep/=2; if( rStep<=2 && cStep<=2 ) break;
     rStep=max(1,rStep); cStep=max(1,cStep); Box B;
@@ -358,7 +370,7 @@ void EdgeBoxGenerator::drawBox( Box &box, arrayf &E, arrayf &V )
 
 void EdgeBoxGenerator::scoreAllBoxes( Boxes &boxes )
 {
-  // get list of all boxes roughly distributed in grid
+  // get list of all boxes roughly distributed in grid  
   boxes.resize(0); int arRad, scNum; float minSize=sqrt(_minBoxArea);
   arRad = int(log(_maxAspectRatio)/log(_arStep*_arStep));
   scNum = int(ceil(log(max(w,h)/minSize)/log(_scStep)));
@@ -373,7 +385,7 @@ void EdgeBoxGenerator::scoreAllBoxes( Boxes &boxes )
       }
     }
   }
-
+   
   // score all boxes, refine top candidates, perform nms
   int i, k=0, m = int(boxes.size());
   for( i=0; i<m; i++ ) {
@@ -383,6 +395,155 @@ void EdgeBoxGenerator::scoreAllBoxes( Boxes &boxes )
   }
   sort(boxes.rbegin(),boxes.rend(),boxesCompare);
   boxes.resize(k); boxesNms(boxes,_beta,_eta,_maxBoxes);
+}
+
+
+///////////////////////////////////////////////////////////////////////
+void EdgeBoxGenerator::refineBox( Box &box, int h, int w )
+{
+  int rStep = h;
+  int cStep = w;
+  while( 1 ) {
+    // prepare for iteration
+    rStep/=2; cStep/=2; if( rStep<=2 && cStep<=2 ) break;
+    rStep=max(1,rStep); cStep=max(1,cStep); 
+    //cout << "rStep: " << rStep << endl;
+    //cout << "cStep: " << cStep << endl;
+    Box B;
+    // search over r start
+    B=box; B.r=box.r-rStep; B.h=B.h+rStep; scoreBox(B);
+    if(B.s<=box.s) { B=box; B.r=box.r+rStep; B.h=B.h-rStep; scoreBox(B); }
+    if(B.s>box.s) box=B;
+    // search over r end
+    B=box; B.h=B.h+rStep; scoreBox(B);
+    if(B.s<=box.s) { B=box; B.h=B.h-rStep; scoreBox(B); }
+    if(B.s>box.s) box=B;
+    // search over c start
+    B=box; B.c=box.c-cStep; B.w=B.w+cStep; scoreBox(B);
+    if(B.s<=box.s) { B=box; B.c=box.c+cStep; B.w=B.w-cStep; scoreBox(B); }
+    if(B.s>box.s) box=B;
+    // search over c end
+    B=box; B.w=B.w+cStep; scoreBox(B);
+    if(B.s<=box.s) { B=box; B.w=B.w-cStep; scoreBox(B); }
+    if(B.s>box.s) box=B;
+  }
+}
+
+void EdgeBoxGenerator::getGT( Boxes &boxes ){
+  boxes.resize(0);  
+  
+  // produce ground truth for each known blob
+  ifstream label_file ("./data/labels/" + _filename + ".txt");
+  string line;
+  int count = 0;   // count the amount of blob
+  
+  if (label_file.is_open())
+  {
+    while ( getline (label_file,line) )
+    {
+      // tackle a single blob at a time
+      count += 1;
+      istringstream iss(line);
+      vector<string> tokens;
+      copy(istream_iterator<string>(iss),
+           istream_iterator<string>(),
+           back_inserter(tokens));
+      
+      Boxes tmp_boxes;
+      tmp_boxes.resize(0);
+      int y_mid = int(416.0*stod(tokens[2])+1);
+      int x_mid = int(416.0*stod(tokens[1])+1);
+      // avoid system error
+      if(y_mid == 1 || x_mid == 1) { continue; }
+      int type  = stoi(tokens[0]);
+      if(type!=0 && type!=1 && type!=2 && type!=3 && type!=4){ continue; }
+      //int default_type_half_size [5] = { 54,50,20,30,56 };
+      
+      // lower bound of area
+      int area_lower_bound = 100;  
+      // upper bound of area
+      // red, purple, green, blue, brown
+      int area_upper_bound [5] = { 17000, 15000, 4000, 8000, 20000 };   
+      for(int h=4; h<=64; h=h+4){
+          for(int w=4; w<=64; w=w+4){
+              Box b;
+              b.r = y_mid - h/2;
+              b.c = x_mid - w/2;
+              if(b.r<0 || b.c<0){ continue; }
+              b.h = h;
+              b.w = w;
+              scoreBox(b);
+              refineBox(b,h,w);
+              
+              // eliminate boxes with area less than 100
+              if(b.h*b.w < area_lower_bound || b.h*b.w > area_upper_bound[type]){
+                  b.s = 0;
+              }
+              // eliminate boxes not surround blob
+              if(b.r>y_mid || (b.r+b.h)<y_mid || b.c>x_mid || (b.c+b.w)<x_mid){
+                  b.s = 0;
+              }              
+              tmp_boxes.push_back(b);
+          }
+      }
+         
+      sort(tmp_boxes.rbegin(),tmp_boxes.rend(),boxesCompare);
+      boxesNms(tmp_boxes,_beta,_eta,_maxBoxes);
+      //sort(tmp_boxes.rbegin(),tmp_boxes.rend(),boxesAreaCompare);
+      
+      // get top three proposed boxes for this blob
+      Box b_avg;
+      b_avg.r = int((tmp_boxes[0].r + tmp_boxes[1].r + tmp_boxes[2].r)/3);
+      b_avg.c = int((tmp_boxes[0].c + tmp_boxes[1].c + tmp_boxes[2].c)/3);
+      b_avg.h = int((tmp_boxes[0].h + tmp_boxes[1].h + tmp_boxes[2].h)/3);
+      b_avg.w = int((tmp_boxes[0].w + tmp_boxes[1].w + tmp_boxes[2].w)/3);
+      scoreBox(b_avg);
+      
+      // set Box to default if avg_score is 0
+      /*
+      if(b_avg.s == 0){
+           int def_size = default_type_half_size[type];
+           b_avg.r = max( y_mid-def_size, 0);
+           b_avg.c = max( x_mid-def_size, 0);
+           b_avg.h = min( 2*def_size, 416-b_avg.r);
+           b_avg.w = min( 2*def_size, 416-b_avg.c);
+           scoreBox(b_avg);
+      }
+      */
+      
+      // update Box's score if avg_score is 0    
+      if(b_avg.s == 0){
+          if(type == 0){
+              b_avg.s = 5;
+          } else {
+              b_avg.s = type;
+          }
+          // adjust up left pos to blob
+          b_avg.r = y_mid;
+          b_avg.c = x_mid;
+      } else {
+          if(type == 0){
+              b_avg.s += 50;
+          } else {
+              b_avg.s += type*10;
+          }
+      }
+      
+      //cout << "b_avg.h: " << b_avg.h << endl;
+      //cout << "b_avg.w: " << b_avg.w << endl;
+      //cout << "b_avg.s: " << b_avg.s << endl;
+      
+      if(b_avg.h == 0 || b_avg.w == 0 || b_avg.h > 200 || b_avg.w > 200 ) { continue; }
+      boxes.push_back(b_avg);
+      // get the box range with n highest score
+      /*
+      for(int idx=0; idx<1; ++idx){
+          boxes.push_back(tmp_boxes[idx]);
+      }
+      */
+    }
+    label_file.close();
+  }
 }
 
 float boxesOverlap( Box &a, Box &b ) {
@@ -425,7 +586,7 @@ void boxesNms( Boxes &boxes, float thr, float eta, int maxBoxes )
 void mexFunction( int nl, mxArray *pl[], int nr, const mxArray *pr[] )
 {
   // check and get inputs
-  if(nr != 14) mexErrMsgTxt("Fourteen inputs required.");
+  if(nr != 15) mexErrMsgTxt("Filename and Fourteen inputs required.");
   if(nl > 2) mexErrMsgTxt("At most two outputs expected.");
   if(mxGetClassID(pr[0])!=mxSINGLE_CLASS) mexErrMsgTxt("E must be a float*");
   if(mxGetClassID(pr[1])!=mxSINGLE_CLASS) mexErrMsgTxt("O must be a float*");
@@ -455,6 +616,8 @@ void mexFunction( int nl, mxArray *pl[], int nr, const mxArray *pr[] )
   edgeBoxGen._minBoxArea = float(mxGetScalar(pr[11]));
   edgeBoxGen._gamma = float(mxGetScalar(pr[12]));
   edgeBoxGen._kappa = float(mxGetScalar(pr[13]));
+  edgeBoxGen._filename = mxArrayToString(pr[14]);
+  //cout << edgeBoxGen._filename << endl;
   edgeBoxGen.generate( boxes, E, O, V );
 
   // create output bbs and output to Matlab
